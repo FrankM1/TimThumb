@@ -4,6 +4,8 @@
  * Based on work done by Tim McDaniels and Darren Hoyt
  * http://code.google.com/p/timthumb/
  * 
+ * Security enhancements by Frank (2025)
+ * 
  * GNU General Public License, version 2
  * http://www.gnu.org/licenses/old-licenses/gpl-2.0.html
  *
@@ -20,7 +22,7 @@
  * loaded by timthumb. This will save you having to re-edit these variables
  * everytime you download a new version
 */
-define ('VERSION', '2.8.14');																		// Version of this script 
+define ('VERSION', '2.9.0'); // Updated to 2.9.0 with security enhancements																		// Version of this script 
 //Load a config file if it exists. Otherwise, use the values below
 if( file_exists(dirname(__FILE__) . '/timthumb-config.php'))	require_once('timthumb-config.php');
 if(! defined('DEBUG_ON') )					define ('DEBUG_ON', false);								// Enable debug logging to web server error log (STDERR)
@@ -145,6 +147,9 @@ if(! isset($ALLOWED_SITES)){
 // -------------- STOP EDITING CONFIGURATION HERE --------------
 // -------------------------------------------------------------
 
+// Enable output buffering to prevent information disclosure
+ob_start();
+
 timthumb::start();
 
 class timthumb {
@@ -189,6 +194,15 @@ class timthumb {
 		global $ALLOWED_SITES;
 		$this->startTime = microtime(true);
 		date_default_timezone_set('UTC');
+		
+		// Set processing time limit
+		set_time_limit(30); // 30 seconds max execution time
+		
+		// Initial security headers
+		header('X-Content-Type-Options: nosniff');
+		header('X-Frame-Options: DENY');
+		header('Content-Security-Policy: default-src \'none\'; img-src \'self\'; base-uri \'none\';');
+		
 		$this->debug(1, "Starting new request from " . $this->getIP() . " to " . $_SERVER['REQUEST_URI']);
 		$this->calcDocRoot();
 		//On windows systems I'm assuming fileinode returns an empty string or a number that doesn't change. Check this.
@@ -409,10 +423,30 @@ class timthumb {
 		}
 	}
 	protected function error($err){
-		$this->debug(3, "Adding error message: $err");
-		$this->errors[] = $err;
+		// Sanitize error message for log output
+		$sanitizedErr = htmlentities($err, ENT_QUOTES, 'UTF-8');
+		$this->debug(3, "Adding error message: $sanitizedErr");
+		
+		// Limit errors array to prevent DOS via memory exhaustion
+		if (count($this->errors) < 100) {
+			$this->errors[] = $sanitizedErr; // Store sanitized version in the errors array
+		}
+		
+		// For security, log all errors with request context
+		if (DEBUG_ON) {
+			$clientIP = $this->getIP();
+			$requestURI = isset($_SERVER['REQUEST_URI']) ? $_SERVER['REQUEST_URI'] : 'unknown';
+			$referer = isset($_SERVER['HTTP_REFERER']) ? $_SERVER['HTTP_REFERER'] : 'unknown';
+			
+			// Sanitize these values too
+			$requestURI = htmlentities($requestURI, ENT_QUOTES, 'UTF-8');
+			$referer = htmlentities($referer, ENT_QUOTES, 'UTF-8');
+			
+			// Enhanced logging with context for security issues
+			error_log("TimThumb Error: {$sanitizedErr} | IP: {$clientIP} | URI: {$requestURI} | Referer: {$referer}");
+		}
+		
 		return false;
-
 	}
 	protected function haveErrors(){
 		if(sizeof($this->errors) > 0){
@@ -462,36 +496,76 @@ class timthumb {
 			return;
 		}
 		$this->debug(3, "cleanCache() called");
+		
+		// Ensure cache directory exists and is writeable
+		if (!is_dir($this->cacheDirectory)) {
+			$this->error("Cache directory does not exist: {$this->cacheDirectory}");
+			return false;
+		}
+		
+		if (!is_writable($this->cacheDirectory)) {
+			$this->error("Cache directory is not writable: {$this->cacheDirectory}");
+			return false;
+		}
+		
 		$lastCleanFile = $this->cacheDirectory . '/timthumb_cacheLastCleanTime.touch';
 		
 		//If this is a new timthumb installation we need to create the file
-		if(! is_file($lastCleanFile)){
+		if (!is_file($lastCleanFile)) {
 			$this->debug(1, "File tracking last clean doesn't exist. Creating $lastCleanFile");
 			if (!touch($lastCleanFile)) {
 				$this->error("Could not create cache clean timestamp file.");
+				return false;
 			}
-			return;
+			// Set proper permissions
+			@chmod($lastCleanFile, 0644);
+			return true;
 		}
-		if(@filemtime($lastCleanFile) < (time() - FILE_CACHE_TIME_BETWEEN_CLEANS) ){ //Cache was last cleaned more than 1 day ago
+		
+		// Check last clean time - use strict comparison instead of @filemtime
+		$lastCleanTime = filemtime($lastCleanFile);
+		if ($lastCleanTime === false) {
+			$this->error("Could not determine last cache clean time");
+			return false;
+		}
+		
+		if ($lastCleanTime < (time() - FILE_CACHE_TIME_BETWEEN_CLEANS)) {
 			$this->debug(1, "Cache was last cleaned more than " . FILE_CACHE_TIME_BETWEEN_CLEANS . " seconds ago. Cleaning now.");
-			// Very slight race condition here, but worst case we'll have 2 or 3 servers cleaning the cache simultaneously once a day.
+			
+			// Update clean timestamp before cleaning to prevent race conditions
 			if (!touch($lastCleanFile)) {
-				$this->error("Could not create cache clean timestamp file.");
+				$this->error("Could not update cache clean timestamp file.");
+				return false;
 			}
-			$files = glob($this->cacheDirectory . '/*' . FILE_CACHE_SUFFIX);
-			if ($files) {
-				$timeAgo = time() - FILE_CACHE_MAX_FILE_AGE;
-				foreach($files as $file){
-					if(@filemtime($file) < $timeAgo){
-						$this->debug(3, "Deleting cache file $file older than max age: " . FILE_CACHE_MAX_FILE_AGE . " seconds");
-						@unlink($file);
+			
+			// Use safe directory scanning instead of glob
+			$cacheDir = dir($this->cacheDirectory);
+			$timeAgo = time() - FILE_CACHE_MAX_FILE_AGE;
+			
+			if ($cacheDir) {
+				while (($file = $cacheDir->read()) !== false) {
+					$fullPath = $this->cacheDirectory . '/' . $file;
+					
+					// Skip directories and non-cache files
+					if (is_dir($fullPath) || !is_file($fullPath) || 
+						!preg_match('/' . preg_quote(FILE_CACHE_SUFFIX, '/') . '$/', $file)) {
+						continue;
+					}
+					
+					$fileModTime = filemtime($fullPath);
+					if ($fileModTime === false || $fileModTime < $timeAgo) {
+						$this->debug(3, "Deleting cache file $fullPath older than max age: " . FILE_CACHE_MAX_FILE_AGE . " seconds");
+						@unlink($fullPath);
 					}
 				}
+				$cacheDir->close();
 			}
+			
 			return true;
 		} else {
 			$this->debug(3, "Cache was cleaned less than " . FILE_CACHE_TIME_BETWEEN_CLEANS . " seconds ago so no cleaning needed.");
 		}
+		
 		return false;
 	}
 	protected function processImageAndWriteToCache($localImage){
@@ -936,70 +1010,195 @@ class timthumb {
 	protected function serveWebshot(){
 		$this->debug(3, "Starting serveWebshot");
 		$instr = "Please follow the instructions at http://code.google.com/p/timthumb/ to set your server up for taking website screenshots.";
-		if(! is_file(WEBSHOT_CUTYCAPT)){
-			return $this->error("CutyCapt is not installed. $instr");
+		
+		// Run security checks first
+		if(!$this->securityChecks()) {
+			return false;
 		}
-		if(! is_file(WEBSHOT_XVFB)){
-			return $this->Error("Xvfb is not installed. $instr");
+		
+		// Validate required binaries
+		if(!is_file(WEBSHOT_CUTYCAPT) || !is_executable(WEBSHOT_CUTYCAPT)){
+			return $this->error("CutyCapt is not installed or not executable. $instr");
 		}
-		$cuty = WEBSHOT_CUTYCAPT;
-		$xv = WEBSHOT_XVFB;
-		$screenX = WEBSHOT_SCREEN_X;
-		$screenY = WEBSHOT_SCREEN_Y;
-		$colDepth = WEBSHOT_COLOR_DEPTH;
-		$format = WEBSHOT_IMAGE_FORMAT;
-		$timeout = WEBSHOT_TIMEOUT * 1000;
-		$ua = WEBSHOT_USER_AGENT;
+		if(!is_file(WEBSHOT_XVFB) || !is_executable(WEBSHOT_XVFB)){
+			return $this->error("Xvfb is not installed or not executable. $instr");
+		}
+		
+		// Create temp file in cache directory with proper permissions
+		$tempfile = tempnam($this->cacheDirectory, 'timthumb_webshot');
+		if(!$tempfile) {
+			return $this->error("Could not create temporary file");
+		}
+		$this->toDelete($tempfile); // Mark for deletion on script end
+		
+		// Secure all command parameters using escapeshellarg/cmd 
+		$cuty = escapeshellcmd(WEBSHOT_CUTYCAPT);
+		$xv = escapeshellcmd(WEBSHOT_XVFB);
+		$screenX = (int)WEBSHOT_SCREEN_X;
+		$screenY = (int)WEBSHOT_SCREEN_Y;
+		$colDepth = (int)WEBSHOT_COLOR_DEPTH;
+		$format = preg_replace('/[^a-z0-9]/i', '', WEBSHOT_IMAGE_FORMAT);
+		$timeout = (int)(WEBSHOT_TIMEOUT * 1000);
 		$jsOn = WEBSHOT_JAVASCRIPT_ON ? 'on' : 'off';
 		$javaOn = WEBSHOT_JAVA_ON ? 'on' : 'off';
 		$pluginsOn = WEBSHOT_PLUGINS_ON ? 'on' : 'off';
-		$proxy = WEBSHOT_PROXY ? ' --http-proxy=' . WEBSHOT_PROXY : '';
-		$tempfile = tempnam($this->cacheDirectory, 'timthumb_webshot');
+		$proxy = '';
+		if(WEBSHOT_PROXY) {
+			$proxy = ' --http-proxy=' . escapeshellarg(WEBSHOT_PROXY);
+		}
+		
+		// Validate and sanitize URL (most critical security aspect)
 		$url = $this->src;
-		if(! preg_match('/^https?:\/\/[a-zA-Z0-9\.\-]+/i', $url)){
-			return $this->error("Invalid URL supplied.");
+		
+		// Enhanced URL validation
+		if(!filter_var($url, FILTER_VALIDATE_URL)) {
+			return $this->error("Invalid URL format supplied.");
 		}
-		$url = preg_replace('/[^A-Za-z0-9\-\.\_:\/\?\&\+\;\=]+/', '', $url); //RFC 3986 plus ()$ chars to prevent exploit below. Plus the following are also removed: @*!~#[]',
-		// 2014 update by Mark Maunder: This exploit: http://cxsecurity.com/issue/WLB-2014060134
-		// uses the $(command) shell execution syntax to execute arbitrary shell commands as the web server user. 
-		// So we're now filtering out the characters: '$', '(' and ')' in the above regex to avoid this. 
-		// We are also filtering out chars rarely used in URLs but legal accoring to the URL RFC which might be exploitable. These include: @*!~#[]',
-		// We're doing this because we're passing this URL to the shell and need to make very sure it's not going to execute arbitrary commands. 
-		if(WEBSHOT_XVFB_RUNNING){
+		
+		// Parse URL to ensure it's properly formatted and only contains HTTP/HTTPS schemes
+		$parsedUrl = parse_url($url);
+		if(!isset($parsedUrl['scheme']) || !isset($parsedUrl['host']) || 
+		   !in_array(strtolower($parsedUrl['scheme']), array('http', 'https'))) {
+			return $this->error("Invalid URL scheme. Only http and https are supported.");
+		}
+		
+		// Reconstruct a safe URL from parsed components
+		$safeUrl = $parsedUrl['scheme'] . '://' . $parsedUrl['host'];
+		if(isset($parsedUrl['port'])) {
+			$safeUrl .= ':' . (int)$parsedUrl['port'];
+		}
+		if(isset($parsedUrl['path'])) {
+			$safeUrl .= $parsedUrl['path'];
+		}
+		if(isset($parsedUrl['query'])) {
+			$safeUrl .= '?' . $parsedUrl['query'];
+		}
+		if(isset($parsedUrl['fragment'])) {
+			$safeUrl .= '#' . $parsedUrl['fragment'];
+		}
+		
+		// Escape the URL for shell usage
+		$escapedUrl = escapeshellarg($safeUrl);
+		$escapedTempfile = escapeshellarg($tempfile);
+		$escapedUA = escapeshellarg(WEBSHOT_USER_AGENT);
+		
+		// Build command with proper escaping
+		if(WEBSHOT_XVFB_RUNNING) {
 			putenv('DISPLAY=:100.0');
-			$command = "$cuty $proxy --max-wait=$timeout --user-agent=\"$ua\" --javascript=$jsOn --java=$javaOn --plugins=$pluginsOn --js-can-open-windows=off --url=\"$url\" --out-format=$format --out=$tempfile";
+			$args = array(
+				$cuty,
+				$proxy,
+				'--max-wait=' . $timeout,
+				'--user-agent=' . $escapedUA,
+				'--javascript=' . $jsOn,
+				'--java=' . $javaOn,
+				'--plugins=' . $pluginsOn,
+				'--js-can-open-windows=off',
+				'--url=' . $escapedUrl,
+				'--out-format=' . $format,
+				'--out=' . $escapedTempfile
+			);
 		} else {
-			$command = "$xv --server-args=\"-screen 0, {$screenX}x{$screenY}x{$colDepth}\" $cuty $proxy --max-wait=$timeout --user-agent=\"$ua\" --javascript=$jsOn --java=$javaOn --plugins=$pluginsOn --js-can-open-windows=off --url=\"$url\" --out-format=$format --out=$tempfile";
+			$args = array(
+				$xv,
+				'--server-args=-screen 0, ' . $screenX . 'x' . $screenY . 'x' . $colDepth,
+				$cuty,
+				$proxy,
+				'--max-wait=' . $timeout,
+				'--user-agent=' . $escapedUA,
+				'--javascript=' . $jsOn,
+				'--java=' . $javaOn,
+				'--plugins=' . $pluginsOn,
+				'--js-can-open-windows=off',
+				'--url=' . $escapedUrl,
+				'--out-format=' . $format,
+				'--out=' . $escapedTempfile
+			);
 		}
+		
+		// Remove any empty arguments
+		$args = array_filter($args);
+		$command = implode(' ', $args);
+		
 		$this->debug(3, "Executing command: $command");
-		$out = `$command`;
-		$this->debug(3, "Received output: $out");
-		if(! is_file($tempfile)){
+		
+		// Use proc_open instead of backticks for better security and control
+		$descriptorspec = array(
+			0 => array("pipe", "r"),  // stdin
+			1 => array("pipe", "w"),  // stdout
+			2 => array("pipe", "w")   // stderr
+		);
+		
+		$process = proc_open($command, $descriptorspec, $pipes);
+		
+		if(is_resource($process)) {
+			// Close stdin
+			fclose($pipes[0]);
+			
+			// Get stdout and stderr
+			$stdout = stream_get_contents($pipes[1]);
+			$stderr = stream_get_contents($pipes[2]);
+			
+			// Close pipes
+			fclose($pipes[1]);
+			fclose($pipes[2]);
+			
+			// Close process
+			$return_value = proc_close($process);
+			
+			$this->debug(3, "Command returned: $return_value, Output: $stdout, Error: $stderr");
+		} else {
+			return $this->error("Failed to execute command");
+		}
+		
+		// Verify the output file was created
+		if(!is_file($tempfile)) {
 			$this->set404();
 			return $this->error("The command to create a thumbnail failed.");
 		}
+		
+		// Process the captured image
 		$this->cropTop = true;
-		if($this->processImageAndWriteToCache($tempfile)){
-			$this->debug(3, "Image processed succesfully. Serving from cache");
+		if($this->processImageAndWriteToCache($tempfile)) {
+			$this->debug(3, "Image processed successfully. Serving from cache");
 			return $this->serveCacheFile();
 		} else {
 			return false;
 		}
 	}
 	protected function serveExternalImage(){
-		if(! preg_match('/^https?:\/\/[a-zA-Z0-9\-\.]+/i', $this->src)){
-			$this->error("Invalid URL supplied.");
+		// Enhanced URL validation
+		if (!filter_var($this->src, FILTER_VALIDATE_URL)) {
+			$this->error("Invalid URL format");
 			return false;
 		}
+		
+		// Validate URL scheme and format
+		$parsedUrl = parse_url($this->src);
+		if (!isset($parsedUrl['scheme']) || !in_array(strtolower($parsedUrl['scheme']), array('http', 'https'))) {
+			$this->error("Invalid URL scheme. Only http and https are supported.");
+			return false;
+		}
+		
+		// Create temp file with proper permissions
 		$tempfile = tempnam($this->cacheDirectory, 'timthumb');
+		if (!$tempfile) {
+			$this->error("Could not create temporary file");
+			return false; 
+		}
+		
+		// Ensure proper permissions for security
+		chmod($tempfile, 0600);
+		
 		$this->debug(3, "Fetching external image into temporary file $tempfile");
 		$this->toDelete($tempfile);
-		#fetch file here
+		
+		// Fetch file with enhanced error handling
 		if(! $this->getURL($this->src, $tempfile)){
 			@unlink($this->cachefile);
 			touch($this->cachefile);
 			$this->debug(3, "Error fetching URL: " . $this->lastURLError);
-			$this->error("Error reading the URL you specified from remote host." . $this->lastURLError);
+			$this->error("Error reading the URL you specified from remote host. " . $this->lastURLError);
 			return false;
 		}
 
@@ -1019,30 +1218,72 @@ class timthumb {
 		}
 	}
 	public static function curlWrite($h, $d){
-		fwrite(self::$curlFH, $d);
-		self::$curlDataWritten += strlen($d);
-		if(self::$curlDataWritten > MAX_FILE_SIZE){
+		// Validate file handle exists
+		if (!is_resource(self::$curlFH)) {
 			return 0;
-		} else {
-			return strlen($d);
 		}
+		
+		// Calculate data length once for efficiency
+		$dataLength = strlen($d);
+		
+		// Check if adding this data would exceed MAX_FILE_SIZE
+		if (self::$curlDataWritten + $dataLength > MAX_FILE_SIZE) {
+			return 0; // Stop the transfer
+		}
+		
+		// Write data and update counter
+		$bytesWritten = fwrite(self::$curlFH, $d);
+		if ($bytesWritten === false) {
+			return 0; // Write failed
+		}
+		
+		self::$curlDataWritten += $bytesWritten;
+		return $dataLength; // Return original data length to continue transfer
 	}
 	protected function serveCacheFile(){
 		$this->debug(3, "Serving {$this->cachefile}");
-		if(! is_file($this->cachefile)){
-			$this->error("serveCacheFile called in timthumb but we couldn't find the cached file.");
+		
+		// Validate cache file exists and is readable
+		if (!is_file($this->cachefile) || !is_readable($this->cachefile)) {
+			$this->error("serveCacheFile called in timthumb but couldn't find or read the cached file.");
 			return false;
 		}
-		$fp = fopen($this->cachefile, 'rb');
-		if(! $fp){ return $this->error("Could not open cachefile."); }
+		
+		// Check file size to prevent empty file serving
+		$fileSize = filesize($this->cachefile);
+		if ($fileSize <= (strlen($this->filePrependSecurityBlock) + 6)) {
+			@unlink($this->cachefile); // Remove corrupt cache file
+			$this->error("Cache file is too small to be valid.");
+			return false;
+		}
+		
+		// Open file with error checking
+		$fp = @fopen($this->cachefile, 'rb');
+		if (!$fp) { 
+			return $this->error("Could not open cachefile."); 
+		}
+		
+		// Read header info
 		fseek($fp, strlen($this->filePrependSecurityBlock), SEEK_SET);
 		$imgType = fread($fp, 3);
 		fseek($fp, 3, SEEK_CUR);
+		
+		// Verify file structure is correct
 		if(ftell($fp) != strlen($this->filePrependSecurityBlock) + 6){
 			@unlink($this->cachefile);
+			fclose($fp);
 			return $this->error("The cached image file seems to be corrupt.");
 		}
-		$imageDataSize = filesize($this->cachefile) - (strlen($this->filePrependSecurityBlock) + 6);
+		
+		// Calculate image data size
+		$imageDataSize = $fileSize - (strlen($this->filePrependSecurityBlock) + 6);
+		if ($imageDataSize <= 0) {
+			@unlink($this->cachefile);
+			fclose($fp);
+			return $this->error("No image data found in cache file.");
+		}
+		
+		// Send appropriate headers
 		$this->sendImageHeaders($imgType, $imageDataSize);
 		$bytesSent = @fpassthru($fp);
 		fclose($fp);
@@ -1067,13 +1308,24 @@ class timthumb {
 		if(strtolower($mimeType) == 'image/jpg'){
 			$mimeType = 'image/jpeg';
 		}
+		// Validate mime type is only an allowed image type
+		if (!in_array(strtolower($mimeType), array('image/jpeg', 'image/png', 'image/gif'))) {
+			$this->error("Invalid mime type: {$mimeType}");
+			return false;
+		}
+		
 		$gmdate_expires = gmdate ('D, d M Y H:i:s', strtotime ('now +10 days')) . ' GMT';
 		$gmdate_modified = gmdate ('D, d M Y H:i:s') . ' GMT';
-		// send content headers then display image
+		
+		// Security-enhanced headers
 		header ('Content-Type: ' . $mimeType);
-		header ('Accept-Ranges: none'); //Changed this because we don't accept range requests
+		header ('Accept-Ranges: none'); // Don't accept range requests
 		header ('Last-Modified: ' . $gmdate_modified);
 		header ('Content-Length: ' . $dataSize);
+		header ('X-Content-Type-Options: nosniff'); // Prevent MIME sniffing
+		header ('X-Frame-Options: DENY'); // Prevent clickjacking
+		header ('Content-Security-Policy: default-src \'none\'; img-src \'self\'; base-uri \'none\';'); // Strict CSP
+		
 		if(BROWSER_CACHE_DISABLE){
 			$this->debug(3, "Browser cache is disabled so setting non-caching headers.");
 			header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
@@ -1087,32 +1339,289 @@ class timthumb {
 		return true;
 	}
 	protected function securityChecks(){
+		// Verify that the request isn't trying to exploit known vulnerabilities
+		
+		// Security: Validate the src parameter is provided and not empty
+		if (empty($this->src)) {
+			$this->error('Source parameter is missing or empty');
+			return false;
+		}
+		
+		// Check for directory traversal attempts - more comprehensive check
+		if (preg_match('/\.\.\/|\.\.\\\\/|\.\.%2f|\.\.%5c/i', $this->src)) {
+			$this->error('Directory traversal attempt detected');
+			return false;
+		}
+		
+		// Check for null byte attacks with comprehensive detection
+		if (strpos($this->src, '\0') !== false || strpos($this->src, '%00') !== false) {
+			$this->error('Null byte attack detected');
+			return false;
+		}
+		
+		// Validate all URL parameters (not just the 'src' parameter)
+		foreach ($_GET as $param => $value) {
+			// Check for null bytes in any parameter
+			if (strpos($value, '\0') !== false || strpos($value, '%00') !== false) {
+				$this->error('Null byte attack detected in parameter: ' . $param);
+				return false;
+			}
+			
+			// Check for suspicious shell command characters in any parameter
+			if (preg_match('/[\\|\\&;`\\\'\\"\\*\\?~<>^\\[\\]\\{\\}\\$\\\\]/', $value)) {
+				$this->error('Suspicious pattern detected in parameter: ' . $param);
+				return false;
+			}
+		}
+		
+		// Validate file extension (if local file)
+		if (!$this->isURL) {
+			$ext = strtolower(pathinfo($this->src, PATHINFO_EXTENSION));
+			if (!in_array($ext, array('jpg', 'jpeg', 'png', 'gif'))) {
+				$this->error('Invalid file extension. Only jpg, jpeg, png, and gif are allowed.');
+				return false;
+			}
+			
+			// Check for absolute paths in local file - improve path security
+			if ($this->src[0] === '/' || preg_match('/^[a-zA-Z]:\\\\/', $this->src)) {
+				$this->error('Absolute path detected. Only relative paths are allowed.');
+				return false;
+			}
+			
+			// Normalize file path to prevent bypass attempts
+			$realPath = realpath($this->src);
+			if ($realPath === false) {
+				$this->error('Invalid file path');
+				return false;
+			}
+			
+			// Make sure the file is within an allowed directory
+			$documentRoot = realpath($_SERVER['DOCUMENT_ROOT']);
+			if (strpos($realPath, $documentRoot) !== 0) {
+				$this->error('File is outside the document root');
+				return false;
+			}
+		}
+		
+		// Check for suspicious character sequences
+		$suspiciousPatterns = array(
+			'/\\(.*\\)/', // Command execution attempt
+			'/\\$\\{.*\\}/', // Variable interpolation
+			'/[\\|\\&;`\\\'\\"\\*\\?~<>^\\[\\]\\{\\}\\$\\\\]/', // Shell metacharacters
+			'/:/', // Windows drive specification when using file:// (e.g., C:)
+			'/data:.*/', // Data URI scheme
+			'/base64/', // Base64 encoded data
+			'/eval\(/', // PHP eval
+			'/system\(/', // PHP system
+			'/exec\(/', // PHP exec
+			'/passthru\(/', // PHP passthru
+			'/proc_open\(/', // PHP proc_open
+			'/shell_exec\(/', // PHP shell_exec
+			'/phpinfo\(/', // PHP info
+			'/include\(/', // PHP include
+			'/require\(/', // PHP require
+		);
+		
+		foreach ($suspiciousPatterns as $pattern) {
+			if (preg_match($pattern, $this->src)) {
+				$this->error('Suspicious pattern detected in src parameter');
+				return false;
+			}
+		}
+		
+		// Validate the source parameter to prevent command injection
+		if ($this->param('webshot') && WEBSHOT_ENABLED) {
+			$url = $this->src;
+			// Strict URL format validation
+			if (!filter_var($url, FILTER_VALIDATE_URL)) {
+				$this->error('Invalid URL format');
+				return false;
+			}
+			
+			// Check for potentially dangerous characters in the URL
+			$dangerousChars = array('$', '`', '\\', '|', '>', '<', ';', '&', '*', '(', ')');
+			foreach ($dangerousChars as $char) {
+				if (strpos($url, $char) !== false) {
+					$this->error('Potentially dangerous character detected in URL');
+					return false;
+				}
+			}
+			
+			// Validate URL scheme
+			$parsedUrl = parse_url($url);
+			if (!isset($parsedUrl['scheme']) || !in_array(strtolower($parsedUrl['scheme']), array('http', 'https'))) {
+				$this->error('Invalid URL scheme. Only http and https are supported.');
+				return false;
+			}
+			
+			// Validate hostname is not localhost or internal IP
+			if (isset($parsedUrl['host'])) {
+				$host = $parsedUrl['host'];
+				if ($host === 'localhost' || $host === '127.0.0.1' || $host === '::1' ||
+					preg_match('/^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.)/', $host)) {
+					$this->error('Local or internal IP addresses are not allowed');
+					return false;
+				}
+			}
+		}
+		
+		return true;
 	}
+	/**
+	 * Sanitizes a string input value
+	 *
+	 * @param string $input The input to sanitize
+	 * @return string Sanitized input
+	 */
+	protected function sanitizeInput($input) {
+		if ($input === null) {
+			return '';
+		}
+		
+		// Convert to string and trim
+		$input = trim((string)$input);
+		
+		// Filter unsafe characters
+		$input = preg_replace('/[\x00-\x1F\x7F<>"\\]/', '', $input);
+		
+		return $input;
+	}
+	
+	/**
+	 * Sanitizes a boolean input value
+	 *
+	 * @param mixed $input The input to convert to boolean
+	 * @return bool Sanitized boolean value
+	 */
+	protected function sanitizeBool($input) {
+		if (is_bool($input)) {
+			return $input;
+		}
+		
+		if (is_string($input)) {
+			return in_array(strtolower($input), array('true', 'yes', '1', 'on'));
+		}
+		
+		return (bool)$input;
+	}
+	
+	/**
+	 * Get a parameter from GET request with sanitization
+	 *
+	 * @param string $property The parameter name
+	 * @param mixed $default Default value if parameter doesn't exist
+	 * @return mixed The sanitized parameter value
+	 */
 	protected function param($property, $default = ''){
-		if (isset ($_GET[$property])) {
-			return $_GET[$property];
+		if (isset($_GET[$property])) {
+			$value = $_GET[$property];
+			
+			// Type-specific sanitization
+			if (is_numeric($default)) {
+				return intval($value);
+			} elseif (is_bool($default)) {
+				return $this->sanitizeBool($value);
+			} else {
+				return $this->sanitizeInput($value);
+			}
 		} else {
 			return $default;
 		}
 	}
+	/**
+	 * Get the MIME type of a file with enhanced security checks
+	 *
+	 * @param string $file Path to the file
+	 * @return string|false The MIME type or false on failure
+	 */
+	protected function getMimeType($file) {
+		// Ensure the file exists and is readable
+		if (!file_exists($file) || !is_readable($file)) {
+			$this->error("Cannot access file: $file");
+			return false;
+		}
+		
+		// Get file extension
+		$ext = strtolower(pathinfo($file, PATHINFO_EXTENSION));
+		
+		// First check extension - most restrictive approach
+		$validExtensions = array(
+			'jpg' => 'image/jpeg',
+			'jpeg' => 'image/jpeg',
+			'png' => 'image/png',
+			'gif' => 'image/gif'
+		);
+		
+		if (!array_key_exists($ext, $validExtensions)) {
+			$this->error("Invalid file extension: $ext");
+			return false;
+		}
+		
+		// Next, use getimagesize for deeper validation
+		$imageInfo = @getimagesize($file);
+		if ($imageInfo === false) {
+			$this->error("Could not determine image type for file: $file");
+			return false;
+		}
+		
+		// Verify mime type from getimagesize matches extension-based type
+		$detectedType = $imageInfo['mime'];
+		if ($detectedType !== $validExtensions[$ext]) {
+			$this->error("MIME type mismatch. Expected {$validExtensions[$ext]}, got {$detectedType}");
+			return false;
+		}
+		
+		// Check for allowed mime types explicitly
+		$allowedMimeTypes = array('image/jpeg', 'image/png', 'image/gif');
+		if (!in_array($detectedType, $allowedMimeTypes)) {
+			$this->error("Unsupported image type: $detectedType");
+			return false;
+		}
+		
+		return $detectedType;
+	}
+	
 	protected function openImage($mimeType, $src){
+		// Validate file exists and is readable
+		if (!file_exists($src) || !is_readable($src)) {
+			$this->error("Cannot read image file: $src");
+			return false;
+		}
+		
+		// Validate file size before opening to prevent DOS
+		$fileSize = @filesize($src);
+		if ($fileSize === false || $fileSize > MAX_FILE_SIZE) {
+			$this->error("File size exceeds limit or cannot be determined");
+			return false;
+		}
+		
+		// Validate mime type strictly
 		switch ($mimeType) {
 			case 'image/jpeg':
-				$image = imagecreatefromjpeg ($src);
+				$image = @imagecreatefromjpeg($src);
 				break;
 
 			case 'image/png':
-				$image = imagecreatefrompng ($src);
-				imagealphablending( $image, true );
-				imagesavealpha( $image, true );
+				$image = @imagecreatefrompng($src);
+				if ($image) {
+					imagealphablending($image, true);
+					imagesavealpha($image, true);
+				}
 				break;
 
 			case 'image/gif':
-				$image = imagecreatefromgif ($src);
+				$image = @imagecreatefromgif($src);
 				break;
 			
 			default:
-				$this->error("Unrecognised mimeType");
+				$this->error("Unsupported image type: $mimeType");
+				return false;
+		}
+		
+		// Check if image creation was successful
+		if (!$image) {
+			$this->error("Could not create image resource from file: $src");
+			return false;
 		}
 
 		return $image;
@@ -1147,22 +1656,155 @@ class timthumb {
 		return $this->error("There is a problem in the timthumb code. Message: Please report this error at <a href='http://code.google.com/p/timthumb/issues/list'>timthumb's bug tracking page</a>: $msg");
 	}
 	protected function getMimeType($file){
-		$info = getimagesize($file);
-		if(is_array($info) && $info['mime']){
-			return $info['mime'];
+		// Validate file exists and is readable
+		if (!file_exists($file) || !is_readable($file)) {
+			$this->error("Cannot read file for mime type detection: $file");
+			return '';
 		}
+		
+		// Get file size before processing to prevent DOS
+		$fileSize = @filesize($file);
+		if ($fileSize === false || $fileSize > MAX_FILE_SIZE) {
+			$this->error("File size exceeds limit or cannot be determined for mime type detection");
+			return '';
+		}
+		
+		// Minimum size check - prevent processing of empty or very small files
+		if ($fileSize < 10) { // A valid image should be at least a few bytes
+			$this->error("File too small to be a valid image");
+			return '';
+		}
+		
+		// Get file extension for additional validation
+		$ext = strtolower(pathinfo($file, PATHINFO_EXTENSION));
+		$allowedExtensions = array('jpg', 'jpeg', 'png', 'gif');
+		
+		if (!in_array($ext, $allowedExtensions)) {
+			$this->error("Invalid file extension: $ext");
+			return '';
+		}
+		
+		// First check file signature (magic bytes) - strongest validation
+		$handle = @fopen($file, 'rb');
+		if (!$handle) {
+			$this->error("Could not open file for signature check: $file");
+			return '';
+		}
+		
+		$signatures = array(
+			// JPEG: FF D8 FF
+			'image/jpeg' => array("\xFF\xD8\xFF"),
+			// PNG: 89 50 4E 47
+			'image/png'  => array("\x89\x50\x4E\x47"),
+			// GIF: GIF8
+			'image/gif'  => array("GIF87a", "GIF89a")
+		);
+		
+		$bytes = @fread($handle, 8); // Read first 8 bytes
+		fclose($handle);
+		
+		$detectedMime = '';
+		
+		// Check file against known signatures
+		foreach ($signatures as $mime => $sigs) {
+			foreach ($sigs as $sig) {
+				$len = strlen($sig);
+				if (substr($bytes, 0, $len) === $sig) {
+					$detectedMime = $mime;
+					break 2;
+				}
+			}
+		}
+		
+		// If signature check fails, proceed with other methods
+		if (empty($detectedMime)) {
+			// Use getimagesize for secondary validation
+			$info = @getimagesize($file);
+			if(is_array($info) && isset($info['mime'])){
+				// Only allow specific image mime types
+				if (preg_match('/^image\/(jpeg|gif|png)$/i', $info['mime'])) {
+					$detectedMime = $info['mime'];
+				} else {
+					$this->error("Unsupported image type detected by getimagesize: {$info['mime']}");
+					return '';
+				}
+			}
+		}
+		
+		// If still not detected, try finfo as last resort
+		if (empty($detectedMime) && function_exists('finfo_open')) {
+			$finfo = finfo_open(FILEINFO_MIME_TYPE);
+			$mime = finfo_file($finfo, $file);
+			finfo_close($finfo);
+			
+			if ($mime && preg_match('/^image\/(jpeg|gif|png)$/i', $mime)) {
+				$detectedMime = $mime;
+			}
+		}
+		
+		// Verify MIME type matches extension
+		if (!empty($detectedMime)) {
+			$extMap = array(
+				'jpg' => 'image/jpeg',
+				'jpeg' => 'image/jpeg',
+				'png' => 'image/png',
+				'gif' => 'image/gif'
+			);
+			
+			// If extension and MIME don't match, reject
+			if (isset($extMap[$ext]) && $extMap[$ext] !== $detectedMime) {
+				$this->error("MIME type ($detectedMime) does not match file extension ($ext)");
+				return '';
+			}
+			
+			return $detectedMime;
+		}
+		
+		$this->error("Could not determine valid MIME type for file");
 		return '';
 	}
 	protected function setMemoryLimit(){
+		// Get current memory limit and validate it
 		$inimem = ini_get('memory_limit');
+		if ($inimem === false) {
+			$this->debug(3, "Could not determine current memory limit");
+			return false;
+		}
+		
+		// Safety check for memory limit conversion
 		$inibytes = timthumb::returnBytes($inimem);
+		if ($inibytes === false) {
+			$this->debug(3, "Could not convert memory limit to bytes");
+			return false;
+		}
+		
+		// Get our defined memory limit
 		$ourbytes = timthumb::returnBytes(MEMORY_LIMIT);
-		if($inibytes < $ourbytes){
-			ini_set ('memory_limit', MEMORY_LIMIT);
+		if ($ourbytes === false) {
+			$this->debug(3, "Could not convert our memory limit to bytes");
+			return false;
+		}
+		
+		// Set a reasonable maximum limit to prevent abuse
+		$maxAllowedBytes = timthumb::returnBytes('256M');
+		if ($ourbytes > $maxAllowedBytes) {
+			$ourbytes = $maxAllowedBytes;
+			$this->debug(3, "Requested memory limit is too high, capping at 256M");
+		}
+		
+		// Only increase memory if our limit is higher
+		if ($inibytes < $ourbytes) {
+			$result = ini_set('memory_limit', MEMORY_LIMIT);
+			if ($result === false) {
+				$this->debug(3, "Failed to increase memory limit");
+				return false;
+			}
 			$this->debug(3, "Increased memory from $inimem to " . MEMORY_LIMIT);
 		} else {
 			$this->debug(3, "Not adjusting memory size because the current setting is " . $inimem . " and our size of " . MEMORY_LIMIT . " is smaller.");
 		}
+		
+		return true;
 	}
 	protected static function returnBytes($size_str){
 		switch (substr ($size_str, -1))
@@ -1176,7 +1818,23 @@ class timthumb {
 	
 	protected function getURL($url, $tempfile){
 		$this->lastURLError = false;
+		
+		// Validate URL format
+		if (!filter_var($url, FILTER_VALIDATE_URL)) {
+			$this->error("Invalid URL format");
+			return false;
+		}
+		
+		// Validate URL scheme (only allow http and https)
+		$parsedUrl = parse_url($url);
+		if (!isset($parsedUrl['scheme']) || !in_array(strtolower($parsedUrl['scheme']), array('http', 'https'))) {
+			$this->error("Invalid URL scheme. Only http and https are supported.");
+			return false;
+		}
+		
+		// Safely encode spaces in URL
 		$url = preg_replace('/ /', '%20', $url);
+		
 		if(function_exists('curl_init')){
 			$this->debug(3, "Curl is installed so using it to fetch URL.");
 			self::$curlFH = fopen($tempfile, 'w');
@@ -1187,14 +1845,20 @@ class timthumb {
 			self::$curlDataWritten = 0;
 			$this->debug(3, "Fetching url with curl: $url");
 			$curl = curl_init($url);
-			curl_setopt ($curl, CURLOPT_TIMEOUT, CURL_TIMEOUT);
-			curl_setopt ($curl, CURLOPT_USERAGENT, "Mozilla/5.0 (Windows NT 6.1) AppleWebKit/534.30 (KHTML, like Gecko) Chrome/12.0.742.122 Safari/534.30");
-			curl_setopt ($curl, CURLOPT_RETURNTRANSFER, TRUE);
-			curl_setopt ($curl, CURLOPT_HEADER, 0);
-			curl_setopt ($curl, CURLOPT_SSL_VERIFYPEER, FALSE);
-			curl_setopt ($curl, CURLOPT_WRITEFUNCTION, 'timthumb::curlWrite');
-			@curl_setopt ($curl, CURLOPT_FOLLOWLOCATION, true);
-			@curl_setopt ($curl, CURLOPT_MAXREDIRS, 10);
+			curl_setopt($curl, CURLOPT_TIMEOUT, CURL_TIMEOUT);
+			curl_setopt($curl, CURLOPT_USERAGENT, "Mozilla/5.0 (Windows NT 6.1) AppleWebKit/534.30 (KHTML, like Gecko) Chrome/12.0.742.122 Safari/534.30");
+			curl_setopt($curl, CURLOPT_RETURNTRANSFER, TRUE);
+			curl_setopt($curl, CURLOPT_HEADER, 0);
+			// Enable SSL certificate verification for security
+			curl_setopt($curl, CURLOPT_SSL_VERIFYPEER, TRUE);
+			curl_setopt($curl, CURLOPT_SSL_VERIFYHOST, 2);
+			curl_setopt($curl, CURLOPT_WRITEFUNCTION, 'timthumb::curlWrite');
+			curl_setopt($curl, CURLOPT_FOLLOWLOCATION, true);
+			curl_setopt($curl, CURLOPT_MAXREDIRS, 5); // Reduced from 10 for security
+			// Set reasonable timeout values
+			curl_setopt($curl, CURLOPT_CONNECTTIMEOUT, 10);
+			// Limit protocols to HTTP and HTTPS
+			curl_setopt($curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
 			
 			$curlResult = curl_exec($curl);
 			fclose(self::$curlFH);
@@ -1238,25 +1902,52 @@ class timthumb {
 
 	}
 	protected function serveImg($file){
-		$s = getimagesize($file);
-		if(! ($s && $s['mime'])){
+		// Validate file exists and is readable
+		if (!file_exists($file) || !is_readable($file)) {
+			$this->error("Cannot read image file: $file");
 			return false;
 		}
-		header ('Content-Type: ' . $s['mime']);
-		header ('Content-Length: ' . filesize($file) );
-		header ('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
-		header ("Pragma: no-cache");
+		
+		// Validate image size and format
+		$s = @getimagesize($file);
+		if(! ($s && $s['mime'])){
+			$this->error("Invalid image file or unable to determine mime type");
+			return false;
+		}
+		
+		// Verify mime type is an image
+		if (!preg_match('/^image\/(jpeg|gif|png)$/i', $s['mime'])) {
+			$this->error("Invalid image mime type: {$s['mime']}");
+			return false;
+		}
+		
+		// Add security headers
+		header('Content-Type: ' . $s['mime']);
+		header('Content-Length: ' . filesize($file));
+		header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+		header('Pragma: no-cache');
+		header('X-Content-Type-Options: nosniff'); // Prevent MIME sniffing
+		header('X-Frame-Options: DENY'); // Prevent clickjacking
+		header('Content-Security-Policy: default-src \'none\'; img-src \'self\'; base-uri \'none\';'); // Strict CSP
+		
+		// Use readfile with output buffering for performance
+		ob_start();
 		$bytes = @readfile($file);
 		if($bytes > 0){
+			ob_end_flush();
 			return true;
 		}
-		$content = @file_get_contents ($file);
-		if ($content != FALSE){
+		ob_end_clean();
+		
+		// Fallback to file_get_contents
+		$content = @file_get_contents($file);
+		if ($content !== FALSE){
 			echo $content;
 			return true;
 		}
+		
+		$this->error("Failed to serve image file");
 		return false;
-
 	}
 	protected function set404(){
 		$this->is404 = true;

